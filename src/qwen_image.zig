@@ -27,6 +27,7 @@ const sse = @import("gen_sse.zig");
 const model_mod = @import("model.zig");
 const tok_mod = @import("tokenizer.zig");
 const mage_flow = @import("mage_flow.zig");
+const lora_mod = @import("lora.zig");
 
 const Weights = model_mod.Weights;
 const S = mlx.mlx_stream;
@@ -504,6 +505,7 @@ pub const Dit = struct {
         self.allocator.free(self.blocks);
     }
 
+
     /// Timestep embedding rows [2, hidden]: row 0 the sampled t, row 1 t = 0.
     /// The sinusoid (cos half first) is f32, cast to the compute dtype BEFORE
     /// the embedder so an f32 modulation never widens the hidden stream.
@@ -726,6 +728,95 @@ pub const Dit = struct {
         return self.proj_out.forward(scaled, null, s);
     }
 };
+
+/// Attach every adapter in `stack` to matching Qwen-Image-2.1 DiT linears.
+/// The stack owns the adapter arrays; linears keep non-owning refs only.
+/// Returns the total number of (module, adapter) matches.
+pub fn attachLora(dit: *Dit, stack: *const lora_mod.Stack) u32 {
+    detachLora(dit);
+
+    var matched: u32 = 0;
+    var kbuf: [160]u8 = undefined;
+    var rbuf: [lora_mod.MAX_LORAS]lora_mod.Ref = undefined;
+
+    // Top-level DiT linears.
+    {
+        const linears = .{
+            .{ "img_in", &dit.img_in },
+            .{ "txt_in.in_layer", &dit.txt_in },
+            .{ "txt_in.out_layer", &dit.txt_out },
+            .{ "time_text_embed.timestep_embedder.linear_1", &dit.t1 },
+            .{ "time_text_embed.timestep_embedder.linear_2", &dit.t2 },
+            .{ "modulation.1", &dit.modulation },
+            .{ "norm_out.linear", &dit.norm_out },
+            .{ "proj_out", &dit.proj_out },
+        };
+
+        inline for (linears) |item| {
+            const refs = stack.findAll(item[0], &rbuf);
+            if (refs.len > 0) {
+                item[1].setLoraRefs(refs);
+                matched += @intCast(refs.len);
+            }
+        }
+    }
+
+    // Transformer blocks.
+    for (dit.blocks, 0..) |*b, i| {
+        const linears = .{
+            .{ "attn.to_q", &b.q },
+            .{ "attn.to_k", &b.k },
+            .{ "attn.to_v", &b.v },
+            .{ "attn.to_out", &b.o },
+            .{ "img_mlp.proj", &b.proj },
+            .{ "img_mlp.gate_layer", &b.gate },
+            .{ "img_mlp.out", &b.out },
+        };
+
+        inline for (linears) |item| {
+            const key = std.fmt.bufPrint(
+                &kbuf,
+                "transformer_blocks.{d}.{s}",
+                .{ i, item[0] },
+            ) catch "";
+
+            const refs = stack.findAll(key, &rbuf);
+            if (refs.len > 0) {
+                item[1].setLoraRefs(refs);
+                matched += @intCast(refs.len);
+            }
+        }
+    }
+
+    return matched;
+}
+
+/// Detach every runtime LoRA from the Qwen-Image-2.1 DiT.
+pub fn detachLora(dit: *Dit) void {
+    inline for (.{
+        &dit.img_in,
+        &dit.txt_in,
+        &dit.txt_out,
+        &dit.t1,
+        &dit.t2,
+        &dit.modulation,
+        &dit.norm_out,
+        &dit.proj_out,
+    }) |lin| lin.clearLoraRefs();
+
+    for (dit.blocks) |*b| {
+        inline for (.{
+            &b.q,
+            &b.k,
+            &b.v,
+            &b.o,
+            &b.proj,
+            &b.gate,
+            &b.out,
+        }) |lin| lin.clearLoraRefs();
+    }
+}
+
 
 // ── VAE (f32, NHWC inside) ──
 

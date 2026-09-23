@@ -670,7 +670,7 @@ pub const ImageEngine = struct {
             .flux => |*f| flux.attachLora(&f.dit, &stack),
             .krea => |k| krea.attachLora(&k.dit, &stack),
             .mage_flow => 0, // MageFlow does not support LoRA (matches mflux)
-            .qwen_image => 0, // no LoRA key mapping yet (matches mflux)
+            .qwen_image => |q| qwen_image.attachLora(&q.dit, &stack),
         };
         if (matched == 0) {
             stack.deinit();
@@ -685,7 +685,8 @@ pub const ImageEngine = struct {
         switch (self.backend) {
             .flux => |*f| flux.detachLora(&f.dit),
             .krea => |k| krea.detachLora(&k.dit),
-            .mage_flow, .qwen_image => {}, // no LoRA attached
+            .mage_flow => {}, // no LoRA attached
+            .qwen_image => |q| qwen_image.detachLora(&q.dit),
         }
         if (self.lora_stack) |*st| st.deinit();
         self.lora_stack = null;

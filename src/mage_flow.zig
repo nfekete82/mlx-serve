@@ -27,6 +27,7 @@ const log = @import("log.zig");
 const stb = @import("stb");
 const qvis = @import("qwen_vision.zig");
 const sse = @import("gen_sse.zig");
+const lora_mod = @import("lora.zig");
 
 // ── Config ──────────────────────────────────────────────────────────────
 // Parsed from the released diffusers-style repo: transformer/config.json,
@@ -571,6 +572,10 @@ pub const MfLinear = struct {
     bits: u32 = 0,
     group_size: u32 = 0,
 
+    // Runtime LoRA adapters. Non-owning: gen.zig's lora.Stack owns the arrays.
+    lora_refs: [lora_mod.MAX_LORAS]lora_mod.Ref = undefined,
+    lora_count: u8 = 0,
+
     /// `in_features` is the module's input dim, known at every call site from
     /// `Config`; it is what makes the packed geometry solvable.
     pub fn load(w: *const Weights, a: std.mem.Allocator, prefix: []const u8, in_features: u32, dtype: mlx.mlx_dtype, s: S) !MfLinear {
@@ -635,26 +640,62 @@ pub const MfLinear = struct {
         // dense path keeps the exact arithmetic the bf16 fixtures were pinned on.
         const xc = try astype(x, self.dtype, s);
         defer _ = mlx.mlx_array_free(xc);
-        if (!self.quantized) return linearT(xc, self.w, bias, s);
-        if (try self.dqGemmWide(xc, bias, s)) |y| return y;
-        var o = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_quantized_matmul(
-            &o,
-            xc,
-            self.w,
-            self.scales,
-            self.biases,
-            true,
-            mlx.mlx_optional_int.some(@intCast(self.group_size)),
-            mlx.mlx_optional_int.some(@intCast(self.bits)),
-            "affine",
-            s,
-        ));
-        if (bias) |b| {
-            defer _ = mlx.mlx_array_free(o);
-            return addA(o, b, s);
+
+        var o = if (!self.quantized)
+            try linearT(xc, self.w, bias, s)
+        else if (try self.dqGemmWide(xc, bias, s)) |y|
+            y
+        else blk: {
+            var q = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(q);
+
+            try mlx.check(mlx.mlx_quantized_matmul(
+                &q,
+                xc,
+                self.w,
+                self.scales,
+                self.biases,
+                true,
+                mlx.mlx_optional_int.some(@intCast(self.group_size)),
+                mlx.mlx_optional_int.some(@intCast(self.bits)),
+                "affine",
+                s,
+            ));
+
+            if (bias) |b| {
+                const r = try addA(q, b, s);
+                _ = mlx.mlx_array_free(q);
+                break :blk r;
+            }
+
+            break :blk q;
+        };
+
+        if (self.lora_count > 0) {
+            const d = try lora_mod.deltaSum(
+                xc,
+                self.lora_refs[0..self.lora_count],
+                s,
+            );
+            defer _ = mlx.mlx_array_free(d);
+
+            const r = try addA(o, d, s);
+            _ = mlx.mlx_array_free(o);
+            o = r;
         }
+
         return o;
+    }
+
+    /// Install stacked runtime LoRA refs for this linear.
+    pub fn setLoraRefs(self: *MfLinear, refs: []const lora_mod.Ref) void {
+        self.lora_count = @intCast(refs.len);
+        @memcpy(self.lora_refs[0..refs.len], refs);
+    }
+
+    /// Detach every runtime LoRA from this linear.
+    pub fn clearLoraRefs(self: *MfLinear) void {
+        self.lora_count = 0;
     }
 
     /// The wide-M dequant+GEMM route; null when the call must stay on qmm.
